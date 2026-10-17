@@ -5,16 +5,16 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 import matplotlib.pyplot as plt
 from matplotlib import cm
+#from tqdm import tqdm
 
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
-EXTENDED_EVALUATION = False
+EXTENDED_EVALUATION = True 
 EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluation
 
 # Cost function constants
 COST_W_UNDERPREDICT = 50.0
 COST_W_NORMAL = 1.0
-
 
 class Model(object):
     """
@@ -29,8 +29,97 @@ class Model(object):
         We already provide a random number generator for reproducibility.
         """
         self.rng = np.random.default_rng(seed=0)
+        # Initialize kernel as RBF
+        self.kernel = RBF(length_scale=5e-4, length_scale_bounds=(1e-5, 1e-2))
 
-        # TODO: Add custom initialization for your model here if necessary
+        # Define number of processes
+        self.n_processes = 64 # Must be a square number
+        self.n_window  = 0.15
+        self.stride = (1 - self.n_window) / (np.sqrt(self.n_processes) - 1)
+        self.GPs = [] 
+        for i in range(self.n_processes):
+            GPi = GaussianProcessRegressor(kernel=self.kernel, n_restarts_optimizer=9)
+            self.GPs.append(GPi)
+
+    """
+    def classify_zones(self, n_window, stride, coordinates):
+        ''' 
+        Defines a zoning of the city with n different zones. n_window and stride must be chosen such that. 
+        n_window + k * stride equals to 1 for some k. 
+        Coordinates is a 2d array (N, 2) that contains the relative coordinates of each point
+
+        returns a new array of shape (N, 2, n), where the last coordinate is a list of n binary numbers, 
+        indicating whether the coordinate is in a given location or not. 
+        '''
+
+        # Compute number of cells. Make sure that it is an integer
+        print('n_window', n_window)
+        print('stride', stride)
+        k = (1 - n_window) / stride 
+        N_regions = int(k**2)
+        
+        N = coordinates.shape[0]
+        ext_coords = {}
+        char_funcs = np.zeros((N, N_regions))
+
+
+        ## BETTER: Have k**2 lists and fill coordinates. This is going to be training data for each local GP
+
+        for n in range(len(coordinates[0])):
+            # Array for storing indices
+            idxs = np.zeros(N_regions)
+            coord = coordinates[n]
+            x = coord[0]
+            y = coord[1]
+
+
+            # Iterate over windows
+            for i in range(int(k)):
+                vertical_bounds = [n_window * i, n_window * (i + 1)]
+
+                # Check if vertical direction is contained in the bounds
+                if y >= vertical_bounds[0] and y < vertical_bounds[1]:  
+
+                    # Iterate over horizontal windows
+                    for j in range(int(k)):
+                        horizontal_bounds = [n_window * j, n_window * (j + 1)]
+
+                        # If the horizontal coordinate is within bounds, correct the index
+                        if x >= horizontal_bounds[0] and x < horizontal_bounds[1]:
+                            idxs[i + j] = 1
+            
+            char_funcs[i,:] = idxs
+            
+
+        return char_funcs 
+
+    """
+    
+    def classify_zones(self, n_window, stride, coordinates):
+        """
+        Overlapping square windows of side n_window, shifted by stride, on [0,1]^2.
+        Requires n_window + k*stride == 1 for some integer k.
+        Returns (N, (k+1)**2) binary array; entry [n, i*(k+1)+j] = 1 if point n
+        lies in window (row i along y, column j along x).
+        """
+        k_float = (1 - n_window) / stride
+        k = int(round(k_float))
+        if not np.isclose(k, k_float):
+            raise ValueError("n_window + k*stride must equal 1 for integer k")
+        n_per_axis = k + 1
+
+        starts = np.arange(n_per_axis) * stride            # (n_per_axis,)
+        x = coordinates[:, 0][:, None]                     # (N, 1)
+        y = coordinates[:, 1][:, None]
+
+        in_x = (x >= starts) & (x < starts + n_window)     # (N, n_per_axis)
+        in_y = (y >= starts) & (y < starts + n_window)
+        # include the right/top edge in the last window
+        in_x[:, -1] |= np.isclose(x[:, 0], 1.0)
+        in_y[:, -1] |= np.isclose(y[:, 0], 1.0)
+
+        N = coordinates.shape[0]
+        return (in_y[:, :, None] & in_x[:, None, :]).reshape(N, -1).astype(float)
 
     # Don't change the name or the signature of this function
     def fit_model(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray, train_residential_flags: np.ndarray):
@@ -40,8 +129,40 @@ class Model(object):
         :param train_pollution_targets: Training pollution concentrations as a 1d NumPy float array of shape (NUM_SAMPLES,)
         :param train_residential_flags: Binary variable denoting whether the 2D training point is in the residential area (1) or not (0)
         """
+        n_window = self.n_window 
+        stride = self.stride
+        char_funcs = self.classify_zones(n_window, stride, train_coordinates)
+        bezirke_training = []
+        bezirke_targets = []
 
-        # TODO: Fit your model here
+        # DATA PREPROCESSING
+        print('DATA PREPROCESSING')
+        for i in range(self.n_processes):
+            # Find training data for this neighborhood 
+            bezirk_i_training = []
+            bezirk_i_targets = []
+            for k in range(train_coordinates.shape[0]):
+                if char_funcs[k, i] == 1 :
+                    bezirk_i_training.append(train_coordinates[k]) 
+                    bezirk_i_targets.append(train_pollution_targets[k]) 
+
+            # Cast to Numpy arrays
+            bezirk_i_training = np.array(bezirk_i_training)
+            bezirke_training.append(bezirk_i_training)
+            bezirk_i_targets = np.array(bezirk_i_targets)
+            bezirke_targets.append(bezirk_i_targets)
+
+        # FITTING LOOP
+        print('FITTING LOOP')
+        for i in range(self.n_processes):
+            # Find corresponding GP for this Bezirk
+            GPi = self.GPs[i]
+            training_coords_i = bezirke_training[i]
+            training_targets_i = bezirke_targets[i]
+            print('shape coords', training_coords_i.shape)  
+            self.GPs[i] = GPi.fit(training_coords_i, training_targets_i)
+
+
         pass
 
     # Don't change the name or the signature of this function
@@ -59,10 +180,36 @@ class Model(object):
         gp_mean = np.zeros(test_coordinates.shape[0], dtype=float)
         gp_std = np.zeros(test_coordinates.shape[0], dtype=float)
 
+        # Extract characteristic functions (NUM_SAMPLES, n_zones)
+        char_funcs = self.classify_zones(self.n_window, self.stride, test_coordinates)
+        GP_means = [] 
+        GP_stds = [] 
+        for i in range(self.n_processes):
+            GPi_means, GPi_stds = self.GPs[i].predict(test_coordinates, return_std=True)
+            GP_means.append(GPi_means)
+            GP_stds.append(GPi_stds)
+
+        GP_means = np.array(GP_means) # (NUM_SAMPLES, n_processes)
+        GP_stds = np.array(GP_stds)
+
+        prec = char_funcs / GP_stds.T**2                 # zero weight outside a zone
+        mean = np.sum(prec * GP_means.T, axis=1) / np.sum(prec, axis=1)
+
+        tot_zones = np.sum(char_funcs, axis=1) # (NUM_SAMPLES,) How many areas does a given point belong to
+
+        '''
+        tot_zones = np.sum(char_funcs, axis=1) # (NUM_SAMPLES,) How many areas does a given point belong to
+        GP_means_relevant = np.sum(GP_means.T * char_funcs, axis=1) / tot_zones
+        '''
+        GPs_sts_relevant = np.sum(GP_stds.T * char_funcs, axis=1) / tot_zones
+
+        k = 2
+
         # TODO: Use the GP posterior to form your predictions here
-        predictions = gp_mean
+        predictions = mean + k * GPs_sts_relevant * test_residential_flags
 
         return predictions, gp_mean, gp_std
+
 
 # You don't have to change this function
 def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, residential_flags: np.ndarray) -> float:
@@ -166,7 +313,7 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
 
     plt.show()
 
-# You do not need to change the name or the signature of this function; convenience helper used by main() 
+
 def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extracts the city_area information from the training and test features.
@@ -180,7 +327,20 @@ def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[
     test_coordinates = np.zeros((test_x.shape[0], 2), dtype=float)
     test_residential_flags = np.zeros((test_x.shape[0],), dtype=bool)
 
-    #TODO: Extract the city_area information from the training and test features
+    train_residential_flags = train_x[:,2]
+    test_residential_flags = test_x[:,2]
+
+    train_coordinates = train_x[:,:2]
+    test_coordinates = test_x[:,:2]
+
+    test_residential_flags_2 = determine_residential_flags(test_coordinates)
+    train_residential_flags_2 = determine_residential_flags(train_coordinates)
+
+    for i in range(len(train_residential_flags)):
+
+        assert train_residential_flags[i] == train_residential_flags_2[i]
+        if i < len(test_residential_flags):
+            assert test_residential_flags[i] == test_residential_flags_2[i]
 
     assert train_coordinates.shape[0] == train_residential_flags.shape[0] and test_coordinates.shape[0] == test_residential_flags.shape[0]
     assert train_coordinates.shape[1] == 2 and test_coordinates.shape[1] == 2
@@ -191,9 +351,10 @@ def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[
 # you don't have to change this function
 def main():
     # Load the training dataset and test features
-    train_x = np.loadtxt('train_x.csv', delimiter=',', skiprows=1)
-    train_y = np.loadtxt('train_y.csv', delimiter=',', skiprows=1)
-    test_x = np.loadtxt('test_x.csv', delimiter=',', skiprows=1)
+    path = 'Task_1/'
+    train_x = np.loadtxt(path +'train_x.csv', delimiter=',', skiprows=1)
+    train_y = np.loadtxt(path +'train_y.csv', delimiter=',', skiprows=1)
+    test_x = np.loadtxt(path + 'test_x.csv', delimiter=',', skiprows=1)
 
     # Extract the city_area information
     train_coordinates, train_residential_flags, test_coordinates, test_residential_flags = get_city_area_data(train_x, test_x)
