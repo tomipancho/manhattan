@@ -30,70 +30,20 @@ class Model(object):
         """
         self.rng = np.random.default_rng(seed=0)
         # Initialize kernel as RBF
-        self.kernel = RBF(length_scale=5e-4, length_scale_bounds=(1e-5, 1e-2))
+        #self.kernel = RBF(length_scale=5e-4, length_scale_bounds=(1e-5,1e-2))
+        self.kernel = Matern(length_scale=5e-2, length_scale_bounds=(1e-2, 1e-1))
 
         # Define number of processes
-        self.n_processes = 64 # Must be a square number
-        self.n_window  = 0.15
+        self.n_processes = 36 # Must be a square number
+        self.n_window  = 0.25 
         self.stride = (1 - self.n_window) / (np.sqrt(self.n_processes) - 1)
         self.GPs = [] 
+        self.k = 10 
         for i in range(self.n_processes):
             GPi = GaussianProcessRegressor(kernel=self.kernel, n_restarts_optimizer=9)
             self.GPs.append(GPi)
 
-    """
-    def classify_zones(self, n_window, stride, coordinates):
-        ''' 
-        Defines a zoning of the city with n different zones. n_window and stride must be chosen such that. 
-        n_window + k * stride equals to 1 for some k. 
-        Coordinates is a 2d array (N, 2) that contains the relative coordinates of each point
 
-        returns a new array of shape (N, 2, n), where the last coordinate is a list of n binary numbers, 
-        indicating whether the coordinate is in a given location or not. 
-        '''
-
-        # Compute number of cells. Make sure that it is an integer
-        print('n_window', n_window)
-        print('stride', stride)
-        k = (1 - n_window) / stride 
-        N_regions = int(k**2)
-        
-        N = coordinates.shape[0]
-        ext_coords = {}
-        char_funcs = np.zeros((N, N_regions))
-
-
-        ## BETTER: Have k**2 lists and fill coordinates. This is going to be training data for each local GP
-
-        for n in range(len(coordinates[0])):
-            # Array for storing indices
-            idxs = np.zeros(N_regions)
-            coord = coordinates[n]
-            x = coord[0]
-            y = coord[1]
-
-
-            # Iterate over windows
-            for i in range(int(k)):
-                vertical_bounds = [n_window * i, n_window * (i + 1)]
-
-                # Check if vertical direction is contained in the bounds
-                if y >= vertical_bounds[0] and y < vertical_bounds[1]:  
-
-                    # Iterate over horizontal windows
-                    for j in range(int(k)):
-                        horizontal_bounds = [n_window * j, n_window * (j + 1)]
-
-                        # If the horizontal coordinate is within bounds, correct the index
-                        if x >= horizontal_bounds[0] and x < horizontal_bounds[1]:
-                            idxs[i + j] = 1
-            
-            char_funcs[i,:] = idxs
-            
-
-        return char_funcs 
-
-    """
     
     def classify_zones(self, n_window, stride, coordinates):
         """
@@ -154,15 +104,12 @@ class Model(object):
 
         # FITTING LOOP
         print('FITTING LOOP')
+        import time
         for i in range(self.n_processes):
-            # Find corresponding GP for this Bezirk
-            GPi = self.GPs[i]
-            training_coords_i = bezirke_training[i]
-            training_targets_i = bezirke_targets[i]
-            print('shape coords', training_coords_i.shape)  
-            self.GPs[i] = GPi.fit(training_coords_i, training_targets_i)
-
-
+            t0 = time.perf_counter()
+            self.GPs[i].fit(bezirke_training[i], bezirke_targets[i])
+            print(i, len(bezirke_training[i]), f"{time.perf_counter() - t0:.2f}s")
+       
         pass
 
     # Don't change the name or the signature of this function
@@ -189,27 +136,22 @@ class Model(object):
             GP_means.append(GPi_means)
             GP_stds.append(GPi_stds)
 
-        GP_means = np.array(GP_means) # (NUM_SAMPLES, n_processes)
-        GP_stds = np.array(GP_stds)
 
-        prec = char_funcs / GP_stds.T**2                 # zero weight outside a zone
-        mean = np.sum(prec * GP_means.T, axis=1) / np.sum(prec, axis=1)
+        GP_means = np.array(GP_means).T # (NUM_SAMPLES, n_processes)
+        GP_stds = np.array(GP_stds).T # (NUM_SAMPLES, n_processes)
 
-        tot_zones = np.sum(char_funcs, axis=1) # (NUM_SAMPLES,) How many areas does a given point belong to
+        prec = char_funcs / (GP_stds ** 2) # Precision is high for small standard deviations
 
-        '''
-        tot_zones = np.sum(char_funcs, axis=1) # (NUM_SAMPLES,) How many areas does a given point belong to
-        GP_means_relevant = np.sum(GP_means.T * char_funcs, axis=1) / tot_zones
-        '''
-        GPs_sts_relevant = np.sum(GP_stds.T * char_funcs, axis=1) / tot_zones
+        stds = np.max(GP_stds * char_funcs, axis=1) # Take the maximum std on each 
 
-        k = 2
+        tot_zones = np.sum(prec, axis=1) # (NUM_SAMPLES,) How many areas does a given point belong to
+
+        GP_means_relevant = np.sum(GP_means * prec, axis=1) / tot_zones
 
         # TODO: Use the GP posterior to form your predictions here
-        predictions = mean + k * GPs_sts_relevant * test_residential_flags
+        predictions = GP_means_relevant + self.k * stds * test_residential_flags
 
         return predictions, gp_mean, gp_std
-
 
 # You don't have to change this function
 def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, residential_flags: np.ndarray) -> float:
